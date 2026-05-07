@@ -1,0 +1,13 @@
+[package]
+name = "SoNoForevis"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+monoio = { version = "0.2", features = ["iouring"] }
+socket2 = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
