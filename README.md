@@ -18,18 +18,18 @@ Objetivo:
 
 ```bash
 docker build \
-  -t fksegundo/rinha-dotnetrust-lb:latest \
+  -t filonsegundo/rinha-dotnetrust-lb:submission \
   .
 ```
 
 ## Publicar
 
 ```bash
-LB_IMAGE=fksegundo/rinha-dotnetrust-lb:latest \
+LB_IMAGE=filonsegundo/rinha-dotnetrust-lb:submission \
 ./scripts/publish-image.sh
 ```
 
 ## Variaveis
 
 - `RUST_TARGET_CPU` - default: `haswell`
-- `LB_IMAGE` - default: `fksegundo/rinha-dotnetrust-lb:latest`
+- `LB_IMAGE` - default: `filonsegundo/rinha-dotnetrust-lb:submission`
