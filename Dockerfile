@@ -14,5 +14,5 @@ COPY src/ ./src/
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-COPY --from=builder /lb/target/release/SoNoForevis /usr/local/bin/lb
+COPY --from=builder /lb/target/release/rinhaLb /usr/local/bin/lb
 ENTRYPOINT ["/usr/local/bin/lb"]
