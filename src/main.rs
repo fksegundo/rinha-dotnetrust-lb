@@ -15,7 +15,7 @@ fn main() {
     let buf_size: usize = std::env::var("BUF_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(8192);
+        .unwrap_or(4096);
 
     let upstreams: Arc<Vec<Arc<str>>> = Arc::new(
         std::env::var("UPSTREAMS")
@@ -28,6 +28,10 @@ fn main() {
     assert!(
         !upstreams.is_empty(),
         "UPSTREAMS must contain at least one path"
+    );
+    assert!(
+        upstreams.len().is_power_of_two(),
+        "UPSTREAMS count must be a power of 2 for optimal scheduling"
     );
 
     let rr: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
@@ -44,6 +48,7 @@ fn main() {
             std::thread::spawn(move || {
                 monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
                     .with_entries(256)
+                    .enable_timer()
                     .build()
                     .expect("failed to build IoUring runtime")
                     .block_on(accept_loop(port, buf_size, upstreams, rr))
@@ -79,7 +84,7 @@ async fn accept_loop(
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 stream.set_nodelay(true).ok();
-                let idx = rr.fetch_add(1, Ordering::Relaxed) % len;
+                let idx = rr.fetch_add(1, Ordering::Relaxed) & (len - 1);
                 let path = upstreams[idx].clone();
                 monoio::spawn(handle_connection(stream, path, buf_size));
             }
