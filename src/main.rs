@@ -1,5 +1,6 @@
 use socket2::{Domain, Socket, Type};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -13,9 +14,14 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8080);
 
+    let upstream_env = std::env::var("FD_UPSTREAMS")
+        .ok()
+        .or_else(|| std::env::var("UPSTREAMS").ok())
+        .expect("UPSTREAMS or FD_UPSTREAMS env var required (comma-separated UDS paths)");
+    let fd_passing = std::env::var("FD_UPSTREAMS").is_ok();
+
     let upstreams: Arc<Vec<Arc<str>>> = Arc::new(
-        std::env::var("UPSTREAMS")
-            .expect("UPSTREAMS env var required (comma-separated UDS paths)")
+        upstream_env
             .split(',')
             .map(|s| Arc::from(s.trim()))
             .filter(|s: &Arc<str>| !s.is_empty())
@@ -51,7 +57,7 @@ fn main() {
                     .enable_time()
                     .build()
                     .expect("failed to build Tokio runtime")
-                    .block_on(accept_loop(port, upstreams, rr, diagnostics))
+                    .block_on(accept_loop(port, upstreams, rr, diagnostics, fd_passing))
             })
         })
         .collect();
@@ -91,6 +97,7 @@ async fn accept_loop(
     upstreams: Arc<Vec<Arc<str>>>,
     rr: Arc<AtomicUsize>,
     diagnostics: bool,
+    fd_passing: bool,
 ) {
     let std_listener = make_listener(port).expect("failed to bind to port");
     let listener =
@@ -107,6 +114,7 @@ async fn accept_loop(
                     idx,
                     upstreams.clone(),
                     diagnostics,
+                    fd_passing,
                 ));
             }
             Err(e) => {
@@ -136,7 +144,13 @@ async fn handle_connection(
     upstream_idx: usize,
     upstreams: Arc<Vec<Arc<str>>>,
     diagnostics: bool,
+    fd_passing: bool,
 ) {
+    if fd_passing {
+        handle_fd_passing_connection(tcp, upstream_idx, upstreams, diagnostics).await;
+        return;
+    }
+
     let mut buf = [0u8; 4096];
     let mut n = 0;
     let mut headers_complete = false;
@@ -195,6 +209,101 @@ async fn handle_connection(
     } else {
         let _ = tokio::io::copy_bidirectional(&mut tcp, &mut uds).await;
     }
+}
+
+async fn handle_fd_passing_connection(
+    mut tcp: TcpStream,
+    upstream_idx: usize,
+    upstreams: Arc<Vec<Arc<str>>>,
+    diagnostics: bool,
+) {
+    let mut buf = [0u8; 128];
+    match tcp.peek(&mut buf).await {
+        Ok(0) => return,
+        Ok(n) if is_ready_request(&buf[..n]) => {
+            let ready = check_backends(&upstreams).await;
+            let response = if ready {
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+            } else {
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+            };
+            let _ = tcp.write_all(response.as_bytes()).await;
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            if diagnostics {
+                eprintln!("tcp peek error: {e}");
+            }
+            return;
+        }
+    }
+
+    let path = upstreams[upstream_idx].clone();
+    let std_tcp = match tcp.into_std() {
+        Ok(stream) => stream,
+        Err(e) => {
+            if diagnostics {
+                eprintln!("into_std error: {e}");
+            }
+            return;
+        }
+    };
+
+    match StdUnixStream::connect(path.as_ref()) {
+        Ok(control) => {
+            if let Err(e) = send_fd(control.as_raw_fd(), std_tcp.as_raw_fd()) {
+                if diagnostics {
+                    eprintln!("send fd error path={}: {}", path, e);
+                }
+            }
+        }
+        Err(e) if diagnostics => {
+            eprintln!("fd upstream connect error path={}: {}", path, e);
+        }
+        _ => {}
+    }
+}
+
+fn send_fd(socket_fd: RawFd, fd_to_send: RawFd) -> std::io::Result<()> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+
+    let mut control = [0u8; 64];
+    let hdr = control.as_mut_ptr().cast::<libc::cmsghdr>();
+
+    unsafe {
+        (*hdr).cmsg_len =
+            (std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<RawFd>()) as _;
+        (*hdr).cmsg_level = libc::SOL_SOCKET;
+        (*hdr).cmsg_type = libc::SCM_RIGHTS;
+
+        let data = control
+            .as_mut_ptr()
+            .add(std::mem::size_of::<libc::cmsghdr>())
+            .cast::<RawFd>();
+        *data = fd_to_send;
+
+        let msg = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov,
+            msg_iovlen: 1,
+            msg_control: control.as_mut_ptr().cast(),
+            msg_controllen: (*hdr).cmsg_len as _,
+            msg_flags: 0,
+        };
+
+        let sent = libc::sendmsg(socket_fd, &msg, 0);
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
