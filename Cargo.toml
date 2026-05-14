@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-monoio = { version = "0.2", features = ["iouring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
 socket2 = "0.5"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
