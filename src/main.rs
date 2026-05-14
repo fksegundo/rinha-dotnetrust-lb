@@ -86,9 +86,9 @@ fn make_listener(port: u16) -> std::io::Result<std::net::TcpListener> {
 }
 
 async fn accept_loop(port: u16, upstreams: Arc<Vec<Arc<str>>>, rr: Arc<AtomicUsize>) {
-    let listener = TcpListener::bind(("0.0.0.0", port))
-        .await
-        .expect("failed to bind to port");
+    let std_listener = make_listener(port).expect("failed to bind to port");
+    let listener = TcpListener::from_std(std_listener)
+        .expect("failed to convert to Tokio listener");
 
     let len = upstreams.len();
     loop {
