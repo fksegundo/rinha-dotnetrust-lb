@@ -118,20 +118,36 @@ async fn check_backends(upstreams: &[Arc<str>]) -> bool {
 }
 
 async fn handle_connection(mut tcp: TcpStream, uds_path: Arc<str>, upstreams: Arc<Vec<Arc<str>>>) {
-    // Read first line to check for /ready endpoint
+    // Read first bytes to check for /ready endpoint
     let mut buf = [0u8; 1024];
-    let n = match tcp.read(&mut buf).await {
-        Ok(0) => return, // Connection closed
-        Ok(n) => n,
-        Err(_) => return,
-    };
+    let mut n = 0;
+    let mut headers_complete = false;
+
+    // Read until we have the full headers or hit buffer limit
+    while n < buf.len() && !headers_complete {
+        match tcp.read(&mut buf[n..]).await {
+            Ok(0) => return, // Connection closed
+            Ok(bytes_read) => {
+                n += bytes_read;
+                // Check if we have \r\n\r\n (end of headers)
+                if n >= 4 {
+                    for i in 0..=(n - 4) {
+                        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+                            headers_complete = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => return,
+        }
+    }
 
     // Check if it's a GET /ready request
     let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
     let is_ready = request.starts_with("GET /ready ") || request.starts_with("GET /ready\r\n");
 
     if is_ready {
-        // Check if backends are ready
         let ready = check_backends(&upstreams).await;
         let response = if ready {
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
@@ -143,7 +159,7 @@ async fn handle_connection(mut tcp: TcpStream, uds_path: Arc<str>, upstreams: Ar
     }
 
     // For non-/ready requests, forward to backend
-    // First, write the already-read bytes to the backend
+    // First, try to connect to backend with retry
     let mut uds = None;
     let mut attempts = 0;
     let max_attempts = 10;
@@ -191,7 +207,6 @@ async fn handle_connection(mut tcp: TcpStream, uds_path: Arc<str>, upstreams: Ar
     // portable way to forward between two streams.
     let res = tokio::io::copy_bidirectional(&mut tcp, &mut uds).await;
     if let Err(e) = res {
-        // Most errors here are benign (client disconnect, etc.)
         let _ = e;
     }
 }
