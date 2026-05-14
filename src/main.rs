@@ -31,6 +31,7 @@ fn main() {
     );
 
     let rr: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let diagnostics = std::env::var("RINHA_LB_DIAG").is_ok_and(|s| s == "1");
 
     let workers: usize = std::env::var("WORKERS")
         .ok()
@@ -50,7 +51,7 @@ fn main() {
                     .enable_time()
                     .build()
                     .expect("failed to build Tokio runtime")
-                    .block_on(accept_loop(port, upstreams, rr))
+                    .block_on(accept_loop(port, upstreams, rr, diagnostics))
             })
         })
         .collect();
@@ -63,7 +64,7 @@ fn main() {
 fn make_listener(port: u16) -> std::io::Result<std::net::TcpListener> {
     let sock = Socket::new(Domain::IPV4, Type::STREAM, None)?;
     sock.set_reuse_address(true)?;
-    // SO_REUSEPORT via libc — guarantees kernel-level accept distribution.
+    // SO_REUSEPORT via libc keeps accept distribution in the kernel.
     unsafe {
         let opt: libc::c_int = 1;
         let fd = sock.as_raw_fd();
@@ -85,10 +86,15 @@ fn make_listener(port: u16) -> std::io::Result<std::net::TcpListener> {
     Ok(sock.into())
 }
 
-async fn accept_loop(port: u16, upstreams: Arc<Vec<Arc<str>>>, rr: Arc<AtomicUsize>) {
+async fn accept_loop(
+    port: u16,
+    upstreams: Arc<Vec<Arc<str>>>,
+    rr: Arc<AtomicUsize>,
+    diagnostics: bool,
+) {
     let std_listener = make_listener(port).expect("failed to bind to port");
-    let listener = TcpListener::from_std(std_listener)
-        .expect("failed to convert to Tokio listener");
+    let listener =
+        TcpListener::from_std(std_listener).expect("failed to convert to Tokio listener");
 
     let len = upstreams.len();
     loop {
@@ -96,8 +102,12 @@ async fn accept_loop(port: u16, upstreams: Arc<Vec<Arc<str>>>, rr: Arc<AtomicUsi
             Ok((stream, _)) => {
                 stream.set_nodelay(true).ok();
                 let idx = rr.fetch_add(1, Ordering::Relaxed) & (len - 1);
-                let path = upstreams[idx].clone();
-                tokio::spawn(handle_connection(stream, path, upstreams.clone()));
+                tokio::spawn(handle_connection(
+                    stream,
+                    idx,
+                    upstreams.clone(),
+                    diagnostics,
+                ));
             }
             Err(e) => {
                 eprintln!("accept error: {}", e);
@@ -108,45 +118,48 @@ async fn accept_loop(port: u16, upstreams: Arc<Vec<Arc<str>>>, rr: Arc<AtomicUsi
 
 async fn check_backends(upstreams: &[Arc<str>]) -> bool {
     for path in upstreams {
-        // Try to connect to each backend with a short timeout
-        match timeout(Duration::from_millis(500), UnixStream::connect(path.as_ref())).await {
-            Ok(Ok(_)) => continue, // Backend is ready
-            _ => return false, // Backend not ready
+        match timeout(
+            Duration::from_millis(500),
+            UnixStream::connect(path.as_ref()),
+        )
+        .await
+        {
+            Ok(Ok(_)) => continue,
+            _ => return false,
         }
     }
     true
 }
 
-async fn handle_connection(mut tcp: TcpStream, uds_path: Arc<str>, upstreams: Arc<Vec<Arc<str>>>) {
-    // Read first bytes to check for /ready endpoint
-    let mut buf = [0u8; 1024];
+async fn handle_connection(
+    mut tcp: TcpStream,
+    upstream_idx: usize,
+    upstreams: Arc<Vec<Arc<str>>>,
+    diagnostics: bool,
+) {
+    let mut buf = [0u8; 4096];
     let mut n = 0;
     let mut headers_complete = false;
 
-    // Read until we have the full headers or hit buffer limit
     while n < buf.len() && !headers_complete {
         match tcp.read(&mut buf[n..]).await {
-            Ok(0) => return, // Connection closed
+            Ok(0) => return,
             Ok(bytes_read) => {
                 n += bytes_read;
-                // Check if we have \r\n\r\n (end of headers)
-                if n >= 4 {
-                    for i in 0..=(n - 4) {
-                        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
-                            headers_complete = true;
-                            break;
-                        }
-                    }
-                }
+                headers_complete = find_header_end(&buf[..n]).is_some();
             }
             Err(_) => return,
         }
     }
 
-    // Check if it's a GET /ready request
-    let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
-    let is_ready = request.starts_with("GET /ready ") || request.starts_with("GET /ready\r\n");
+    if !headers_complete {
+        let _ = tcp
+            .write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
 
+    let is_ready = is_ready_request(&buf[..n]);
     if is_ready {
         let ready = check_backends(&upstreams).await;
         let response = if ready {
@@ -158,55 +171,73 @@ async fn handle_connection(mut tcp: TcpStream, uds_path: Arc<str>, upstreams: Ar
         return;
     }
 
-    // For non-/ready requests, forward to backend
-    // First, try to connect to backend with retry
-    let mut uds = None;
-    let mut attempts = 0;
-    let max_attempts = 10;
-
-    while attempts < max_attempts {
-        match timeout(Duration::from_secs(1 + (attempts as u64)), UnixStream::connect(uds_path.as_ref())).await {
-            Ok(Ok(s)) => {
-                uds = Some(s);
-                break;
-            }
-            Ok(Err(e)) => {
-                eprintln!("upstream connect error (attempt {}): {}", attempts + 1, e);
-                attempts += 1;
-                if attempts < max_attempts {
-                    tokio::time::sleep(Duration::from_millis(100 * (1 << attempts.min(4)))).await;
-                }
-            }
-            Err(_) => {
-                eprintln!("upstream connect timeout (attempt {})", attempts + 1);
-                attempts += 1;
-                if attempts < max_attempts {
-                    tokio::time::sleep(Duration::from_millis(100 * (1 << attempts.min(4)))).await;
-                }
-            }
-        }
-    }
-
-    let mut uds = match uds {
+    let mut uds = match connect_upstream(&upstreams, upstream_idx, diagnostics).await {
         Some(s) => s,
         None => {
-            eprintln!("upstream connect failed after {} attempts", max_attempts);
-            let _ = tcp.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n").await;
+            let _ = tcp
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+                .await;
             return;
         }
     };
 
-    // Write the already-read bytes to backend
     if let Err(e) = uds.write_all(&buf[..n]).await {
-        eprintln!("write to backend error: {}", e);
+        if diagnostics {
+            eprintln!("write to backend error: {}", e);
+        }
         return;
     }
 
-    // Use Tokio's optimized bidirectional copy.  It uses an 8 KiB
-    // buffer per direction (reused across polls) and is the fastest
-    // portable way to forward between two streams.
-    let res = tokio::io::copy_bidirectional(&mut tcp, &mut uds).await;
-    if let Err(e) = res {
-        let _ = e;
+    if diagnostics {
+        if let Err(e) = tokio::io::copy_bidirectional(&mut tcp, &mut uds).await {
+            eprintln!("proxy copy error: {}", e);
+        }
+    } else {
+        let _ = tokio::io::copy_bidirectional(&mut tcp, &mut uds).await;
     }
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+}
+
+fn is_ready_request(buf: &[u8]) -> bool {
+    buf.starts_with(b"GET /ready ") || buf.starts_with(b"GET /ready\r\n")
+}
+
+async fn connect_upstream(
+    upstreams: &[Arc<str>],
+    start_idx: usize,
+    diagnostics: bool,
+) -> Option<UnixStream> {
+    let len = upstreams.len();
+
+    for round in 0..2 {
+        for offset in 0..len {
+            let idx = (start_idx + offset) & (len - 1);
+            let path = upstreams[idx].as_ref();
+
+            match timeout(Duration::from_millis(150), UnixStream::connect(path)).await {
+                Ok(Ok(stream)) => return Some(stream),
+                Ok(Err(e)) if diagnostics => {
+                    eprintln!(
+                        "upstream connect error path={} round={}: {}",
+                        path,
+                        round + 1,
+                        e
+                    );
+                }
+                Err(_) if diagnostics => {
+                    eprintln!("upstream connect timeout path={} round={}", path, round + 1);
+                }
+                _ => {}
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    None
 }
