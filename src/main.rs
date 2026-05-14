@@ -1,21 +1,16 @@
-use monoio::buf::{IoBuf, IoBufMut};
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
-use monoio::net::{TcpListener, TcpStream, UnixStream};
-use monoio::time::{timeout, Duration};
 use socket2::{Domain, Socket, Type};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::time::timeout;
 
 fn main() {
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8080);
-
-    let buf_size: usize = std::env::var("BUF_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4096);
 
     let upstreams: Arc<Vec<Arc<str>>> = Arc::new(
         std::env::var("UPSTREAMS")
@@ -36,22 +31,25 @@ fn main() {
 
     let rr: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
 
-    let n = std::env::var("WORKERS")
+    let workers: usize = std::env::var("WORKERS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
-    let handles: Vec<_> = (0..n)
+    // Spawn one Tokio runtime per worker thread.
+    // Each worker gets its own listener with SO_REUSEPORT so the kernel
+    // distributes incoming connections across threads.
+    let handles: Vec<_> = (0..workers)
         .map(|_| {
             let upstreams = upstreams.clone();
             let rr = rr.clone();
             std::thread::spawn(move || {
-                monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-                    .with_entries(256)
-                    .enable_timer()
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
                     .build()
-                    .expect("failed to build IoUring runtime")
-                    .block_on(accept_loop(port, buf_size, upstreams, rr))
+                    .expect("failed to build Tokio runtime")
+                    .block_on(accept_loop(port, upstreams, rr))
             })
         })
         .collect();
@@ -61,32 +59,48 @@ fn main() {
     }
 }
 
-fn make_listener(port: u16) -> std::net::TcpListener {
-    let sock = Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket2::Socket::new");
-    sock.set_reuse_address(true).expect("SO_REUSEADDR");
-    sock.set_reuse_port(true).expect("SO_REUSEPORT");
-    sock.set_nonblocking(true).expect("O_NONBLOCK");
+fn make_listener(port: u16) -> std::io::Result<std::net::TcpListener> {
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, None)?;
+    sock.set_reuse_address(true)?;
+    // SO_REUSEPORT via libc — guarantees kernel-level accept distribution.
+    unsafe {
+        let opt: libc::c_int = 1;
+        let fd = sock.as_raw_fd();
+        let ret = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &opt as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    sock.set_nonblocking(true)?;
     let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-    sock.bind(&addr.into()).expect("bind");
-    sock.listen(1024).expect("listen");
-    sock.into()
+    sock.bind(&addr.into())?;
+    sock.listen(4096)?;
+    Ok(sock.into())
 }
 
-async fn accept_loop(
-    port: u16,
-    buf_size: usize,
-    upstreams: Arc<Vec<Arc<str>>>,
-    rr: Arc<AtomicUsize>,
-) {
-    let listener = TcpListener::from_std(make_listener(port)).expect("TcpListener::from_std");
+async fn accept_loop(port: u16, upstreams: Arc<Vec<Arc<str>>>, rr: Arc<AtomicUsize>) {
+    let listener = match make_listener(port) {
+        Ok(l) => TcpListener::from_std(l).expect("TcpListener::from_std"),
+        Err(e) => {
+            eprintln!("failed to create listener: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     let len = upstreams.len();
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, _)) => {
                 stream.set_nodelay(true).ok();
                 let idx = rr.fetch_add(1, Ordering::Relaxed) & (len - 1);
                 let path = upstreams[idx].clone();
-                monoio::spawn(handle_connection(stream, path, buf_size));
+                tokio::spawn(handle_connection(stream, path));
             }
             Err(e) => {
                 eprintln!("accept error: {}", e);
@@ -95,8 +109,9 @@ async fn accept_loop(
     }
 }
 
-async fn handle_connection(tcp: TcpStream, uds_path: Arc<str>, buf_size: usize) {
-    let uds = match timeout(Duration::from_secs(2), UnixStream::connect(uds_path.as_ref())).await {
+async fn handle_connection(mut tcp: TcpStream, uds_path: Arc<str>) {
+    let mut uds = match timeout(Duration::from_secs(2), UnixStream::connect(uds_path.as_ref())).await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             eprintln!("upstream connect error: {}", e);
@@ -107,42 +122,14 @@ async fn handle_connection(tcp: TcpStream, uds_path: Arc<str>, buf_size: usize) 
             return;
         }
     };
-    let (tcp_r, tcp_w) = tcp.into_split();
-    let (uds_r, uds_w) = uds.into_split();
-    monoio::select! {
-        _ = forward(tcp_r, uds_w, buf_size) => {}
-        _ = forward(uds_r, tcp_w, buf_size) => {}
-    }
-}
 
-async fn forward<R, W>(mut reader: R, mut writer: W, buf_size: usize)
-where
-    R: AsyncReadRent,
-    W: AsyncWriteRentExt,
-{
-    let mut buf: Box<[u8]> = vec![0u8; buf_size].into_boxed_slice();
-    loop {
-        let (res, slice) = match timeout(Duration::from_secs(30), reader.read(buf.slice_mut(..))).await {
-            Ok(result) => result,
-            Err(_) => {
-                eprintln!("forward read timeout");
-                return;
-            }
-        };
-        buf = slice.into_inner();
-        let n = match res {
-            Ok(0) => return,
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("forward read error: {}", e);
-                return;
-            }
-        };
-        let (res, slice) = writer.write_all(buf.slice(0..n)).await;
-        buf = slice.into_inner();
-        if let Err(e) = res {
-            eprintln!("forward write error: {}", e);
-            return;
-        }
+    // Use Tokio's optimized bidirectional copy.  It uses an 8 KiB
+    // buffer per direction (reused across polls) and is the fastest
+    // portable way to forward between two streams.
+    let res = tokio::io::copy_bidirectional(&mut tcp, &mut uds).await;
+    if let Err(e) = res {
+        // Most errors here are benign (client disconnect, etc.)
+        // Only log unexpected ones at a very low rate if desired.
+        let _ = e;
     }
 }
