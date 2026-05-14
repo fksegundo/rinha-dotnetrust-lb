@@ -3,6 +3,7 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::time::timeout;
 
@@ -85,13 +86,9 @@ fn make_listener(port: u16) -> std::io::Result<std::net::TcpListener> {
 }
 
 async fn accept_loop(port: u16, upstreams: Arc<Vec<Arc<str>>>, rr: Arc<AtomicUsize>) {
-    let listener = match make_listener(port) {
-        Ok(l) => TcpListener::from_std(l).expect("TcpListener::from_std"),
-        Err(e) => {
-            eprintln!("failed to create listener: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let listener = TcpListener::bind(("0.0.0.0", port))
+        .await
+        .expect("failed to bind to port");
 
     let len = upstreams.len();
     loop {
@@ -100,7 +97,7 @@ async fn accept_loop(port: u16, upstreams: Arc<Vec<Arc<str>>>, rr: Arc<AtomicUsi
                 stream.set_nodelay(true).ok();
                 let idx = rr.fetch_add(1, Ordering::Relaxed) & (len - 1);
                 let path = upstreams[idx].clone();
-                tokio::spawn(handle_connection(stream, path));
+                tokio::spawn(handle_connection(stream, path, upstreams.clone()));
             }
             Err(e) => {
                 eprintln!("accept error: {}", e);
@@ -109,8 +106,44 @@ async fn accept_loop(port: u16, upstreams: Arc<Vec<Arc<str>>>, rr: Arc<AtomicUsi
     }
 }
 
-async fn handle_connection(mut tcp: TcpStream, uds_path: Arc<str>) {
-    // Retry connection with exponential backoff (up to 10 attempts, longer timeout)
+async fn check_backends(upstreams: &[Arc<str>]) -> bool {
+    for path in upstreams {
+        // Try to connect to each backend with a short timeout
+        match timeout(Duration::from_millis(500), UnixStream::connect(path.as_ref())).await {
+            Ok(Ok(_)) => continue, // Backend is ready
+            _ => return false, // Backend not ready
+        }
+    }
+    true
+}
+
+async fn handle_connection(mut tcp: TcpStream, uds_path: Arc<str>, upstreams: Arc<Vec<Arc<str>>>) {
+    // Read first line to check for /ready endpoint
+    let mut buf = [0u8; 1024];
+    let n = match tcp.read(&mut buf).await {
+        Ok(0) => return, // Connection closed
+        Ok(n) => n,
+        Err(_) => return,
+    };
+
+    // Check if it's a GET /ready request
+    let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    let is_ready = request.starts_with("GET /ready ") || request.starts_with("GET /ready\r\n");
+
+    if is_ready {
+        // Check if backends are ready
+        let ready = check_backends(&upstreams).await;
+        let response = if ready {
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        } else {
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+        };
+        let _ = tcp.write_all(response.as_bytes()).await;
+        return;
+    }
+
+    // For non-/ready requests, forward to backend
+    // First, write the already-read bytes to the backend
     let mut uds = None;
     let mut attempts = 0;
     let max_attempts = 10;
@@ -142,9 +175,16 @@ async fn handle_connection(mut tcp: TcpStream, uds_path: Arc<str>) {
         Some(s) => s,
         None => {
             eprintln!("upstream connect failed after {} attempts", max_attempts);
+            let _ = tcp.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n").await;
             return;
         }
     };
+
+    // Write the already-read bytes to backend
+    if let Err(e) = uds.write_all(&buf[..n]).await {
+        eprintln!("write to backend error: {}", e);
+        return;
+    }
 
     // Use Tokio's optimized bidirectional copy.  It uses an 8 KiB
     // buffer per direction (reused across polls) and is the fastest
@@ -152,7 +192,6 @@ async fn handle_connection(mut tcp: TcpStream, uds_path: Arc<str>) {
     let res = tokio::io::copy_bidirectional(&mut tcp, &mut uds).await;
     if let Err(e) = res {
         // Most errors here are benign (client disconnect, etc.)
-        // Only log unexpected ones at a very low rate if desired.
         let _ = e;
     }
 }
