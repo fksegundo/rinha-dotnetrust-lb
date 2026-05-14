@@ -110,15 +110,38 @@ async fn accept_loop(port: u16, upstreams: Arc<Vec<Arc<str>>>, rr: Arc<AtomicUsi
 }
 
 async fn handle_connection(mut tcp: TcpStream, uds_path: Arc<str>) {
-    let mut uds = match timeout(Duration::from_secs(2), UnixStream::connect(uds_path.as_ref())).await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            eprintln!("upstream connect error: {}", e);
-            return;
+    // Retry connection with exponential backoff (up to 5 attempts)
+    let mut uds = None;
+    let mut attempts = 0;
+    let max_attempts = 5;
+
+    while attempts < max_attempts {
+        match timeout(Duration::from_millis(500 * (1 << attempts)), UnixStream::connect(uds_path.as_ref())).await {
+            Ok(Ok(s)) => {
+                uds = Some(s);
+                break;
+            }
+            Ok(Err(e)) => {
+                eprintln!("upstream connect error (attempt {}): {}", attempts + 1, e);
+                attempts += 1;
+                if attempts < max_attempts {
+                    tokio::time::sleep(Duration::from_millis(50 * (1 << attempts))).await;
+                }
+            }
+            Err(_) => {
+                eprintln!("upstream connect timeout (attempt {})", attempts + 1);
+                attempts += 1;
+                if attempts < max_attempts {
+                    tokio::time::sleep(Duration::from_millis(50 * (1 << attempts))).await;
+                }
+            }
         }
-        Err(_) => {
-            eprintln!("upstream connect timeout");
+    }
+
+    let mut uds = match uds {
+        Some(s) => s,
+        None => {
+            eprintln!("upstream connect failed after {} attempts", max_attempts);
             return;
         }
     };
