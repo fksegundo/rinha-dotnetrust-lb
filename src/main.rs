@@ -124,21 +124,6 @@ async fn accept_loop(
     }
 }
 
-async fn check_backends(upstreams: &[Arc<str>]) -> bool {
-    for path in upstreams {
-        match timeout(
-            Duration::from_millis(500),
-            UnixStream::connect(path.as_ref()),
-        )
-        .await
-        {
-            Ok(Ok(_)) => continue,
-            _ => return false,
-        }
-    }
-    true
-}
-
 async fn handle_connection(
     mut tcp: TcpStream,
     upstream_idx: usize,
@@ -173,18 +158,6 @@ async fn handle_connection(
         return;
     }
 
-    let is_ready = is_ready_request(&buf[..n]);
-    if is_ready {
-        let ready = check_backends(&upstreams).await;
-        let response = if ready {
-            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
-        } else {
-            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
-        };
-        let _ = tcp.write_all(response.as_bytes()).await;
-        return;
-    }
-
     let mut uds = match connect_upstream(&upstreams, upstream_idx, diagnostics).await {
         Some(s) => s,
         None => {
@@ -212,36 +185,17 @@ async fn handle_connection(
 }
 
 async fn handle_fd_passing_connection(
-    mut tcp: TcpStream,
+    tcp: TcpStream,
     upstream_idx: usize,
     upstreams: Arc<Vec<Arc<str>>>,
     diagnostics: bool,
 ) {
-    let mut buf = [0u8; 128];
-    match tcp.peek(&mut buf).await {
-        Ok(0) => return,
-        Ok(n) if is_ready_request(&buf[..n]) => {
-            let ready = check_backends(&upstreams).await;
-            let response = if ready {
-                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
-            } else {
-                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
-            };
-            let _ = tcp.write_all(response.as_bytes()).await;
-            return;
-        }
-        Ok(_) => {}
-        Err(e) => {
-            if diagnostics {
-                eprintln!("tcp peek error: {e}");
-            }
-            return;
-        }
-    }
-
     let path = upstreams[upstream_idx].clone();
     let std_tcp = match tcp.into_std() {
-        Ok(stream) => stream,
+        Ok(stream) => {
+            let _ = stream.set_nonblocking(false);
+            stream
+        }
         Err(e) => {
             if diagnostics {
                 eprintln!("into_std error: {e}");
@@ -310,10 +264,6 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map(|pos| pos + 4)
-}
-
-fn is_ready_request(buf: &[u8]) -> bool {
-    buf.starts_with(b"GET /ready ") || buf.starts_with(b"GET /ready\r\n")
 }
 
 async fn connect_upstream(
