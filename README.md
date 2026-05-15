@@ -1,7 +1,7 @@
 # rinha-dotnetrust-lb
 
 [![Build image](https://github.com/fksegundo/rinha-dotnetrust-lb/actions/workflows/publish-image.yml/badge.svg)](https://github.com/fksegundo/rinha-dotnetrust-lb/actions/workflows/publish-image.yml)
-[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-filonsegundo%2Frinha--dotnetrust--lb-blue)](https://hub.docker.com/r/filonsegundo/rinha-dotnetrust-lb)
+[![GHCR image](https://img.shields.io/badge/GHCR-rinha--api--lb-blue)](https://github.com/users/fksegundo/packages/container/package/rinha-api-lb)
 
 Companion custom load balancer for the `rinha-dotnetrust` submission to the [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026) challenge.
 
