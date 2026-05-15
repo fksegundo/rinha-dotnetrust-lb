@@ -1,22 +1,74 @@
 # rinha-dotnetrust-lb
 
-## PT-BR
+[![Build image](https://github.com/fksegundo/rinha-dotnetrust-lb/actions/workflows/publish-image.yml/badge.svg)](https://github.com/fksegundo/rinha-dotnetrust-lb/actions/workflows/publish-image.yml)
+[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-filonsegundo%2Frinha--dotnetrust--lb-blue)](https://hub.docker.com/r/filonsegundo/rinha-dotnetrust-lb)
 
-Repositorio separado do load balancer usado pela submissao `rinha-dotnetrust`.
+Companion custom load balancer for the `rinha-dotnetrust` submission to the [Rinha de Backend 2026](https://github.com/zanfranceschi/rinha-de-backend-2026) challenge.
 
-Objetivo:
+This is a minimal, high-throughput TCP load balancer written in Rust. It accepts external HTTP traffic and forwards it to API backend instances over Unix Domain Sockets, with support for both standard TCP proxying and zero-copy Unix socket file-descriptor passing.
 
-- manter a imagem do gateway sob nosso controle
-- desacoplar a submissao principal do codigo do balancer
-- publicar uma imagem propria no Docker Hub para ser usada no `docker-compose.yml` final
+## Why a custom load balancer?
 
-Stack:
+- Keep the gateway image under our control
+- Decouple the main submission repository from balancer source code
+- Publish our own image for the final `docker-compose.yml`
+- Support FD passing (`SCM_RIGHTS`) for lightweight socket handoff to API processes
 
-- Rust
-- monoio + io_uring
-- proxy TCP simples para duas instancias da API via Unix Domain Socket
+## Architecture
 
-Build local:
+```text
+client
+  |
+  v
+TCP :PORT (SO_REUSEPORT, multi-worker)
+  |
+  v
+LB process
+  |
+  |--[proxy mode]----> UDS connect -> backend
+  |
+  +--[fd-pass mode]--> SCM_RIGHTS -> backend handles socket directly
+```
+
+The LB binds to a TCP port with `SO_REUSEPORT` so the kernel distributes incoming connections across worker threads. Each worker runs a single-threaded Tokio runtime. Accepted sockets are dispatched to backends via round-robin with a bitwise mask (upstream count must be a power of 2).
+
+## Modes of operation
+
+### 1. TCP proxy mode (`UPSTREAMS`)
+
+The LB reads the HTTP request headers from the client, detects `GET /ready` for health-check responses, connects to the selected backend Unix socket, and then proxies the full connection bidirectionally.
+
+Backend selection retries up to 2 rounds with 150 ms connect timeout and 25 ms backoff.
+
+### 2. FD passing mode (`FD_UPSTREAMS`)
+
+The LB peeks the first bytes of the TCP stream to detect `GET /ready`. For normal requests, it converts the Tokio `TcpStream` to a standard `std::net::TcpStream`, connects a control Unix socket to the backend, and sends the client socket file descriptor using `SCM_RIGHTS` via `sendmsg`. The backend process receives the FD and handles the HTTP connection directly.
+
+This avoids copying data through the LB process after the handoff.
+
+## Configuration
+
+All settings are passed via environment variables:
+
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `UPSTREAMS` | yes* | — | Comma-separated UDS paths for proxy mode |
+| `FD_UPSTREAMS` | yes* | — | Comma-separated UDS paths for FD-passing mode |
+| `PORT` | no | `8080` | TCP port to listen on |
+| `WORKERS` | no | `1` | Number of worker threads (each gets its own `SO_REUSEPORT` listener) |
+| `RINHA_LB_DIAG` | no | `0` | Set to `1` to enable diagnostic error logging |
+
+*One of `UPSTREAMS` or `FD_UPSTREAMS` must be provided.
+
+The number of upstream entries must be a power of 2 for optimal round-robin scheduling.
+
+## Endpoints handled by the LB
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/ready` | Readiness probe. The LB checks all backends with a 500 ms UDS connect timeout and returns `200 ok` or `503 Service Unavailable` |
+
+## Local build
 
 ```bash
 docker build \
@@ -24,45 +76,55 @@ docker build \
   .
 ```
 
-Publicar:
+## Publish
 
 ```bash
 LB_IMAGE=filonsegundo/rinha-dotnetrust-lb:submission \
 ./scripts/publish-image.sh
 ```
 
-## EN
+## Build variables
 
-Standalone repository for the load balancer used by the `rinha-dotnetrust` submission.
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RUST_TARGET_CPU` | `haswell` | Target CPU for `rustc` codegen |
+| `LB_IMAGE` | `filonsegundo/rinha-dotnetrust-lb:submission` | Image tag used by the publish script |
 
-Goals:
+## Implementation notes
 
-- keep the gateway image under our control
-- decouple the main submission repository from balancer source code
-- publish our own Docker Hub image for the final `docker-compose.yml`
+### SO_REUSEPORT worker distribution
 
-Stack:
+Instead of a single listener shared across threads, each worker creates its own `SO_REUSEPORT` socket. The kernel load-balances incoming TCP connections across them, eliminating accept-queue contention.
+
+### Minimal HTTP parsing
+
+The proxy mode parses just enough HTTP to detect `GET /ready` and find the end of the headers (`\r\n\r\n`). Everything else is forwarded as raw bytes.
+
+### Health check
+
+The `/ready` endpoint is handled by the LB itself. It attempts to connect to every configured backend Unix socket within 500 ms. Only if all succeed does it return `200 OK`.
+
+## Project layout
+
+```text
+src/
+  main.rs                LB entrypoint: listener setup, accept loop, proxy and FD-pass handlers
+
+Dockerfile               Multi-stage build with cargo-chef for layer caching
+```
+
+## Stack
 
 - Rust
-- monoio + io_uring
-- simple TCP proxy to two API instances over Unix Domain Sockets
+- Tokio (single-threaded runtime per worker)
+- socket2 (for `SO_REUSEPORT`)
+- libc (for `SCM_RIGHTS` FD passing)
 
-Local build:
+## Related repositories
 
-```bash
-docker build \
-  -t filonsegundo/rinha-dotnetrust-lb:submission \
-  .
-```
+- [fksegundo/rinha-rust](https://github.com/fksegundo/rinha-rust) — main submission this load balancer serves
+- [zanfranceschi/rinha-de-backend-2026](https://github.com/zanfranceschi/rinha-de-backend-2026) — official challenge repository
 
-Publish:
+## Acknowledgments
 
-```bash
-LB_IMAGE=filonsegundo/rinha-dotnetrust-lb:submission \
-./scripts/publish-image.sh
-```
-
-## Variables
-
-- `RUST_TARGET_CPU` - default: `haswell`
-- `LB_IMAGE` - default: `filonsegundo/rinha-dotnetrust-lb:submission`
+Some ideas for this load balancer were inspired by the approach used in [jairoblatt/SoNoForevis](https://github.com/jairoblatt/SoNoForevis).
