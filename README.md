@@ -100,10 +100,6 @@ Instead of a single listener shared across threads, each worker creates its own 
 
 The proxy mode parses just enough HTTP to detect `GET /ready` and find the end of the headers (`\r\n\r\n`). Everything else is forwarded as raw bytes.
 
-### Health check
-
-The `/ready` endpoint is handled by the LB itself. It attempts to connect to every configured backend Unix socket within 500 ms. Only if all succeed does it return `200 OK`.
-
 ## Project layout
 
 ```text
