@@ -1,6 +1,6 @@
 use socket2::{Domain, Socket, Type};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream as StdUnixStream;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -141,13 +141,13 @@ async fn handle_connection(
     let mut headers_complete = false;
 
     while n < buf.len() && !headers_complete {
-        match tcp.read(&mut buf[n..]).await {
-            Ok(0) => return,
-            Ok(bytes_read) => {
+        match timeout(Duration::from_millis(500), tcp.read(&mut buf[n..])).await {
+            Ok(Ok(0)) => return,
+            Ok(Ok(bytes_read)) => {
                 n += bytes_read;
                 headers_complete = find_header_end(&buf[..n]).is_some();
             }
-            Err(_) => return,
+            _ => return,
         }
     }
 
@@ -190,32 +190,57 @@ async fn handle_fd_passing_connection(
     upstreams: Arc<Vec<Arc<str>>>,
     diagnostics: bool,
 ) {
-    let path = upstreams[upstream_idx].clone();
-    let std_tcp = match tcp.into_std() {
-        Ok(stream) => {
-            let _ = stream.set_nonblocking(false);
-            stream
-        }
-        Err(e) => {
-            if diagnostics {
-                eprintln!("into_std error: {e}");
-            }
-            return;
-        }
-    };
+    let len = upstreams.len();
+    for round in 0..2 {
+        for offset in 0..len {
+            let idx = (upstream_idx + offset) & (len - 1);
+            let path = upstreams[idx].as_ref();
 
-    match StdUnixStream::connect(path.as_ref()) {
-        Ok(control) => {
-            if let Err(e) = send_fd(control.as_raw_fd(), std_tcp.as_raw_fd()) {
-                if diagnostics {
-                    eprintln!("send fd error path={}: {}", path, e);
+            match timeout(Duration::from_millis(150), UnixStream::connect(path)).await {
+                Ok(Ok(stream)) => {
+                    let std_tcp = match tcp.into_std() {
+                        Ok(t) => {
+                            let _ = t.set_nonblocking(false);
+                            t
+                        }
+                        Err(e) => {
+                            if diagnostics {
+                                eprintln!("into_std error: {e}");
+                            }
+                            return;
+                        }
+                    };
+
+                    let std_control = match stream.into_std() {
+                        Ok(c) => {
+                            let _ = c.set_nonblocking(false);
+                            c
+                        }
+                        Err(e) => {
+                            if diagnostics {
+                                eprintln!("uds into_std error: {e}");
+                            }
+                            return;
+                        }
+                    };
+
+                    if let Err(e) = send_fd(std_control.as_raw_fd(), std_tcp.as_raw_fd()) {
+                        if diagnostics {
+                            eprintln!("send fd error path={}: {}", path, e);
+                        }
+                    }
+                    return;
                 }
+                Ok(Err(e)) if diagnostics => {
+                    eprintln!("fd upstream connect error path={} round={}: {}", path, round + 1, e);
+                }
+                Err(_) if diagnostics => {
+                    eprintln!("fd upstream connect timeout path={} round={}", path, round + 1);
+                }
+                _ => {}
             }
         }
-        Err(e) if diagnostics => {
-            eprintln!("fd upstream connect error path={}: {}", path, e);
-        }
-        _ => {}
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
